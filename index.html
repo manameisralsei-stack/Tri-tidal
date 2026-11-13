@@ -1,0 +1,259 @@
+<!doctype html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-title" content="Tri Tidal">
+<meta name="theme-color" content="#101420">
+<meta name="color-scheme" content="dark">
+<title>Tri Tidal</title>
+<style>
+:root{--bg:#101420;--panel:#1a2133;--line:#2b3550;--txt:#eef1f8;--dim:#93a0bd;--yes:#2fb67a;--no:#e5484d;--accent:#6ea8ff}
+*{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+html,body{margin:0;height:100%;background:var(--bg);color:var(--txt);font:16px/1.4 "Avenir Next",-apple-system,"Segoe UI",Roboto,sans-serif}
+#app{min-height:100%;max-width:480px;margin:0 auto;padding:calc(env(safe-area-inset-top,0px) + 18px) 18px calc(env(safe-area-inset-bottom,0px) + 18px);display:flex;flex-direction:column;gap:14px}
+h1{font-size:26px;margin:4px 0 0;letter-spacing:-.02em}
+h2{font-size:19px;margin:0}
+p{margin:0;color:var(--dim)}
+input,button,.btn{font:inherit;color:inherit}
+input{width:100%;padding:13px 14px;border-radius:12px;border:1px solid var(--line);background:var(--panel)}
+.btn{display:block;width:100%;text-align:left;padding:14px 16px;border-radius:12px;border:1px solid var(--line);background:var(--panel);cursor:pointer;text-decoration:none}
+.btn.main{background:var(--accent);border-color:var(--accent);color:#0a1020;font-weight:600;text-align:center}
+.btn.small{width:auto;padding:9px 12px;font-size:14px;color:var(--dim)}
+.row{display:flex;gap:10px;flex-wrap:wrap}
+code{background:var(--panel);padding:2px 6px;border-radius:6px;word-break:break-all;color:var(--txt)}
+.card{background:var(--panel);border:1px solid var(--line);border-radius:22px;padding:16px;display:flex;flex-direction:column;gap:14px}
+.cover{aspect-ratio:1;width:100%;border-radius:14px;background:#222c45 center/cover no-repeat}
+.title{font-size:24px;font-weight:700;line-height:1.15;letter-spacing:-.02em}
+.stat{font-size:14px;color:var(--dim);display:flex;justify-content:space-between}
+.choice{display:flex;gap:16px;justify-content:center;padding:4px 0}
+.choice button{width:92px;height:92px;border-radius:50%;border:0;font-size:40px;color:#fff;cursor:pointer}
+.choice .no{background:var(--no)}.choice .yes{background:var(--yes)}
+.choice button:active{transform:scale(.94)}
+button:focus-visible,.btn:focus-visible,input:focus-visible{outline:3px solid var(--accent);outline-offset:2px}
+iframe{width:100%;height:110px;border:0;border-radius:12px}
+.toast{color:#ffd27a;font-size:14px}
+.err{color:#ff9a9d}
+</style>
+</head>
+<body>
+<main id="app"></main>
+<script>
+const API='https://openapi.tidal.com/v2',AUTH='https://login.tidal.com/authorize',TOKEN='https://auth.tidal.com/v1/oauth2/token';
+const SCOPE='collection.read playlists.read playlists.write user.read';
+const REDIR=location.origin+location.pathname;
+const MAX_PAGES=25;
+const $app=document.getElementById('app');
+const ls={get:(k,d)=>{try{const v=JSON.parse(localStorage.getItem(k));return v??d}catch{return d}},set:(k,v)=>localStorage.setItem(k,JSON.stringify(v))};
+const S={clientId:ls.get('clientId',''),tok:ls.get('tok',null),me:ls.get('me',null),dec:ls.get('dec',{}),pend:ls.get('pend',[]),plId:ls.get('plId',null),plName:ls.get('plName','')};
+const save=()=>{ls.set('dec',S.dec);ls.set('pend',S.pend)};
+const esc=s=>String(s??'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+const sleep=ms=>new Promise(r=>setTimeout(r,ms));
+const view=h=>{$app.innerHTML=h};
+let artists=[],inPl=new Set(),cur=null,last=null,warming=false,flushing=false;
+
+/* ---------- Auth (PKCE) ---------- */
+const b64u=b=>btoa(String.fromCharCode(...new Uint8Array(b))).replace(/\+/g,'-').replace(/\//g,'_').replace(/=+$/,'');
+async function login(){
+  const v=b64u(crypto.getRandomValues(new Uint8Array(48)));
+  const ch=b64u(await crypto.subtle.digest('SHA-256',new TextEncoder().encode(v)));
+  localStorage.setItem('pkce',v);
+  location.href=AUTH+'?'+new URLSearchParams({response_type:'code',client_id:S.clientId,redirect_uri:REDIR,scope:SCOPE,code_challenge_method:'S256',code_challenge:ch,state:'tri'});
+}
+async function tokenReq(p){
+  const r=await fetch(TOKEN,{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:new URLSearchParams({client_id:S.clientId,...p})});
+  const j=await r.json();
+  if(!r.ok)throw new Error(j.error_description||j.error||'Connexion refusée');
+  S.tok={access:j.access_token,refresh:j.refresh_token||S.tok?.refresh,exp:Date.now()+(j.expires_in||3600)*1000-60000};
+  ls.set('tok',S.tok);
+}
+async function handleCallback(){
+  const q=new URLSearchParams(location.search),code=q.get('code');
+  if(!code)return;
+  history.replaceState(null,'',REDIR);
+  await tokenReq({grant_type:'authorization_code',code,redirect_uri:REDIR,code_verifier:localStorage.getItem('pkce')});
+}
+async function ensureToken(){
+  if(S.tok&&Date.now()>S.tok.exp&&S.tok.refresh)await tokenReq({grant_type:'refresh_token',refresh_token:S.tok.refresh});
+}
+
+/* ---------- API ---------- */
+const full=p=>p.startsWith('http')?p:p.startsWith('/v2')?'https://openapi.tidal.com'+p:API+p;
+async function api(p,o={},retry=true){
+  await ensureToken();
+  const r=await fetch(full(p),{...o,headers:{Authorization:'Bearer '+S.tok.access,Accept:'application/vnd.api+json',...(o.body?{'Content-Type':'application/vnd.api+json'}:{})}});
+  if(r.status===401&&retry&&S.tok.refresh){await tokenReq({grant_type:'refresh_token',refresh_token:S.tok.refresh});return api(p,o,false)}
+  if(r.status===429){await sleep((+r.headers.get('Retry-After')||2)*1000);return api(p,o,retry)}
+  if(r.status===204)return null;
+  const t=await r.text(),j=t?JSON.parse(t):null;
+  if(!r.ok)throw new Error((j?.errors?.[0]?.detail||j?.errors?.[0]?.code||'Erreur')+' ('+r.status+')');
+  return j;
+}
+async function paged(p,max=MAX_PAGES){
+  const data=[],inc=[];
+  for(let i=0;p&&i<max;i++){
+    const j=await api(p);
+    data.push(...(j.data||[]));inc.push(...(j.included||[]));
+    p=j.links?.next||null;
+  }
+  return{data,inc};
+}
+
+/* ---------- Écrans ---------- */
+function setup(msg){
+  view(`<h1>Tri Tidal</h1>
+  <p>Colle ici l’identifiant client (Client ID) de ton appli créée sur developer.tidal.com. Il reste uniquement sur cet appareil.</p>
+  <input id="cid" placeholder="Client ID" value="${esc(S.clientId)}" autocapitalize="off" autocorrect="off">
+  <p>URL de redirection à déclarer dans ton appli Tidal :<br><code>${esc(REDIR)}</code></p>
+  ${msg?`<p class="err">${esc(msg)}</p>`:''}
+  <button class="btn main" onclick="saveId()">Se connecter à Tidal</button>`);
+}
+function saveId(){
+  const v=document.getElementById('cid').value.trim();
+  if(!v)return;
+  S.clientId=v;ls.set('clientId',v);login();
+}
+async function pickPlaylist(){
+  view(`<h1>Tri Tidal</h1><p>Je charge tes playlists…</p>`);
+  try{
+    if(!S.me){
+      const j=await api('/users/me');
+      S.me={id:j.data.id,cc:j.data.attributes?.country||'FR'};ls.set('me',S.me);
+    }
+    const {data}=await paged(`/playlists?countryCode=${S.me.cc}&filter%5Bowners.id%5D=me&include=owners`);
+    const rows=data.map(p=>`<button class="btn" onclick="choose('${esc(p.id)}','${esc((p.attributes?.name||'Sans titre').replace(/'/g,'’'))}')">${esc(p.attributes?.name||'Sans titre')}</button>`).join('');
+    const quick=S.plId?`<button class="btn main" onclick="choose('${esc(S.plId)}','${esc(S.plName.replace(/'/g,'’'))}')">Continuer avec « ${esc(S.plName)} »</button>`:'';
+    view(`<h1>Dans quelle playlist ajouter ?</h1>${quick}<h2>Mes playlists</h2>${rows||'<p>Aucune playlist trouvée. Crées-en une dans Tidal puis reviens.</p>'}
+    <div class="row"><button class="btn small" onclick="exportDec()">Copier ma sauvegarde</button><button class="btn small" onclick="importDec()">Restaurer</button><button class="btn small" onclick="resetAll()">Tout réinitialiser</button><button class="btn small" onclick="logout()">Déconnexion</button></div>`);
+  }catch(e){fail(e,pickPlaylist)}
+}
+function fail(e,retry){
+  view(`<h1>Oups</h1><p class="err">${esc(e.message)}</p><button class="btn main" id="rt">Réessayer</button><button class="btn" onclick="logout()">Me reconnecter</button>`);
+  document.getElementById('rt').onclick=retry;
+}
+async function choose(id,name){
+  S.plId=id;S.plName=name;ls.set('plId',id);ls.set('plName',name);
+  view(`<h1>${esc(name)}</h1><p id="st">Je charge tes artistes suivis…</p>`);
+  try{
+    const cc=S.me.cc;
+    const a=await paged(`/userCollectionArtists/me/relationships/items?countryCode=${cc}&include=items`,200);
+    const names={};a.inc.filter(x=>x.type==='artists').forEach(x=>names[x.id]=x.attributes?.name);
+    artists=a.data.map(x=>({id:x.id,name:names[x.id]||'Artiste',tracks:null,done:false}));
+    document.getElementById('st').textContent='Je regarde ce qui est déjà dans la playlist…';
+    const pl=await paged(`/playlists/${id}/relationships/items?countryCode=${cc}`,200);
+    inPl=new Set(pl.data.map(x=>x.id));
+    flush();
+    swipe();
+  }catch(e){fail(e,()=>choose(id,name))}
+}
+
+/* ---------- Titres ---------- */
+async function loadArtist(a){
+  if(a.tracks)return;
+  a.tracks=[];
+  const cc=S.me.cc,base=`/artists/${a.id}/relationships/tracks?countryCode=${cc}&collapseBy=FINGERPRINT`;
+  let res;
+  try{res=await paged(base+'&include=tracks,tracks.artists,tracks.albums,tracks.albums.coverArt')}
+  catch{try{res=await paged(base+'&include=tracks')}catch(e){a.failed=true;return}}
+  const m={};res.inc.forEach(x=>m[x.type+':'+x.id]=x);
+  const rel=(x,k)=>(x?.relationships?.[k]?.data||[]);
+  a.tracks=res.data.map(r=>{
+    const t=m['tracks:'+r.id];if(!t)return null;
+    const at=t.attributes||{};
+    const alb=m['albums:'+rel(t,'albums')[0]?.id];
+    const art=m['artworks:'+rel(alb,'coverArt')[0]?.id];
+    const files=(art?.attributes?.files||[]).slice().sort((x,y)=>(x.meta?.width||0)-(y.meta?.width||0));
+    const f=files.find(x=>(x.meta?.width||0)>=320)||files[files.length-1];
+    return{id:r.id,title:at.title+(at.version?' ('+at.version+')':''),by:rel(t,'artists').map(x=>m['artists:'+x.id]?.attributes?.name).filter(Boolean).join(', ')||a.name,cover:f?.href||'',artist:a.name};
+  }).filter(Boolean);
+}
+const undecided=t=>!(t.id in S.dec)&&!inPl.has(t.id);
+async function nextTrack(){
+  for(;;){
+    const cand=artists.filter(a=>!a.done);
+    if(!cand.length)return null;
+    const a=cand[Math.random()*cand.length|0];
+    await loadArtist(a);
+    const r=(a.tracks||[]).filter(undecided);
+    if(!r.length){a.done=true;continue}
+    warm();
+    return r[Math.random()*r.length|0];
+  }
+}
+async function warm(){
+  if(warming)return;
+  const c=artists.filter(a=>!a.done&&!a.tracks);
+  if(!c.length)return;
+  warming=true;
+  try{await loadArtist(c[Math.random()*c.length|0])}finally{warming=false}
+}
+const stats=()=>{const n=Object.keys(S.dec).length,y=Object.values(S.dec).filter(v=>v===1).length;return`${n} triés · ${y} ajoutés${S.pend.length?` · ${S.pend.length} en attente`:''}`};
+
+async function swipe(){
+  view(`<div class="card"><div class="cover"></div><div class="title">Je cherche un titre…</div></div>`);
+  try{cur=await nextTrack()}catch(e){return fail(e,swipe)}
+  if(!cur){
+    return view(`<h1>C’est terminé 🎉</h1><p>Tous les titres de tes artistes suivis ont été triés (${esc(stats())}).</p><p>Si tu suis de nouveaux artistes, reviens : seuls les nouveaux titres seront proposés.</p><button class="btn" onclick="pickPlaylist()">Changer de playlist</button>`);
+  }
+  view(`<div class="stat"><span>${esc(S.plName)}</span><span>${esc(stats())}</span></div>
+  <div class="card">
+    <div class="cover" style="${cur.cover?`background-image:url('${esc(cur.cover)}')`:''}"></div>
+    <div><div class="title">${esc(cur.title)}</div><p>${esc(cur.by)}</p></div>
+    <div id="pl"></div>
+    <div class="row"><button class="btn small" onclick="listen()">▶ Écouter</button><a class="btn small" target="_blank" rel="noopener" href="https://tidal.com/track/${esc(cur.id)}">Ouvrir dans Tidal</a>${last?'<button class="btn small" onclick="undo()">↩ Annuler</button>':''}</div>
+  </div>
+  <div class="choice"><button class="no" aria-label="Non" onclick="decide(0)">✕</button><button class="yes" aria-label="Oui" onclick="decide(1)">✓</button></div>
+  <p class="toast" id="msg"></p>
+  <button class="btn small" onclick="pickPlaylist()">Changer de playlist</button>`);
+}
+function listen(){document.getElementById('pl').innerHTML=`<iframe src="https://embed.tidal.com/tracks/${esc(cur.id)}" allow="encrypted-media" title="Écoute"></iframe>`}
+function decide(yes){
+  if(!cur)return;
+  S.dec[cur.id]=yes;
+  if(yes)S.pend.push({pl:S.plId,id:cur.id});
+  last={id:cur.id,yes};save();
+  if(yes)flush();
+  swipe();
+}
+function undo(){
+  if(!last)return;
+  const i=S.pend.findIndex(p=>p.id===last.id);
+  if(last.yes&&i<0){document.getElementById('msg').textContent='Déjà ajouté à la playlist : retire-le directement dans Tidal.';return}
+  if(i>=0)S.pend.splice(i,1);
+  delete S.dec[last.id];last=null;save();swipe();
+}
+async function flush(){
+  if(flushing||!S.pend.length||!S.me)return;
+  flushing=true;
+  try{
+    while(S.pend.length){
+      const pl=S.pend[0].pl,batch=S.pend.filter(p=>p.pl===pl).slice(0,20);
+      await api(`/playlists/${pl}/relationships/items?countryCode=${S.me.cc}`,{method:'POST',body:JSON.stringify({data:batch.map(b=>({id:b.id,type:'tracks'}))})});
+      S.pend=S.pend.filter(p=>!batch.includes(p));save();
+    }
+  }catch(e){const m=document.getElementById('msg');if(m)m.textContent='Ajout en attente (réseau ou Tidal) : '+e.message}
+  flushing=false;
+}
+setInterval(flush,15000);
+
+/* ---------- Sauvegarde / maintenance ---------- */
+async function exportDec(){try{await navigator.clipboard.writeText(JSON.stringify(S.dec));alert('Sauvegarde copiée dans le presse-papiers.')}catch{prompt('Copie ceci :',JSON.stringify(S.dec))}}
+function importDec(){
+  const t=prompt('Colle ta sauvegarde :');if(!t)return;
+  try{Object.assign(S.dec,JSON.parse(t));save();alert('Sauvegarde restaurée.')}catch{alert('Sauvegarde invalide.')}
+}
+function resetAll(){if(confirm('Oublier tous les titres déjà triés ? Ils seront reproposés.')){S.dec={};S.pend=[];save();pickPlaylist()}}
+function logout(){localStorage.removeItem('tok');localStorage.removeItem('me');S.tok=null;S.me=null;setup()}
+
+/* ---------- Démarrage ---------- */
+(async()=>{
+  navigator.storage?.persist?.();
+  try{await handleCallback()}catch(e){return setup(e.message)}
+  if(!S.clientId||!S.tok)return setup();
+  pickPlaylist();
+})();
+</script>
+</body>
+</html>
